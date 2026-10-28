@@ -1,0 +1,50 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== Виртуальные окружения =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== Данные (скачиваются отдельно) =====
+part_a/data/*
+!part_a/data/README.md
+!part_a/data/.gitkeep
+part_b/data/*
+!part_b/data/README.md
+!part_b/data/.gitkeep
+
+# ===== Тяжёлые артефакты обучения =====
+*.joblib
+*.pt
+*.pkl
+*.parquet
+*.npy
+
+# ===== Часть А =====
+part_a/outputs/*
+# !part_a/outputs/*.csv
+# !part_a/outputs/*.json
+# !part_a/outputs/*.png
+# part_a/outputs/train.csv
+# part_a/outputs/test.csv
+
+# ===== Часть Б =====
+part_b/outputs_b/*
+# !part_b/outputs_b/*.csv
+# !part_b/outputs_b/*.json
+# !part_b/outputs_b/*.png
+# part_b/outputs_b/customers.parquet
+# part_b/outputs_b/customers.csv

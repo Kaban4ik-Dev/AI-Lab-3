@@ -1,0 +1,352 @@
+# run_part_a.py — полностью исправленная версия
+import json
+import time
+import warnings
+import traceback
+
+import numpy as np
+import pandas as pd
+import joblib
+import torch
+
+from config import (DATA_PATH, OUT_DIR, RANDOM_STATE, TEST_FRACTION,
+                    N_EXPANDING_FOLDS, PARAM_GRIDS, NN_CONFIGS, NN_SEEDS,
+                    NN_MAX_EPOCHS, NN_PATIENCE)
+from data_utils import (sha256_of, load_bank_marketing, data_passport,
+                        clean, column_types)
+from eda import eda_report
+from splits import time_split, expanding_window_folds
+from models_sklearn import (make_preprocessor, build_model, get_scores,
+                            search_family, OwnLogregAdapter)
+from model_nn import train_nn, predict_scores_nn
+from metrics_utils import (classification_metrics, find_best_threshold,
+                           plot_roc_pr, bootstrap_diff_ap)
+
+# --- подавляем шум от sklearn (не влияет на результаты) ---
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.impute")
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+
+LOG_PATH = OUT_DIR / "runs.csv"
+SEARCH_PATH = OUT_DIR / "search_summary.csv"
+RUN_ID = time.strftime("%Y%m%d_%H%M%S")
+log_rows = []
+
+
+def log_run(**kw):
+    kw.setdefault("run_id", RUN_ID)
+    kw.setdefault("ts", time.time())
+    log_rows.append(kw)
+    pd.DataFrame(log_rows).to_csv(LOG_PATH, index=False)
+
+
+def _params_key(p):
+    return json.dumps(p, sort_keys=True, default=str)
+
+
+def main():
+    # ---------- 1. ПАСПОРТ ДАННЫХ ----------
+    print("[1/9] Паспорт данных")
+    checksum = sha256_of(DATA_PATH)
+    df_raw = load_bank_marketing(DATA_PATH)
+    passport_raw = data_passport(df_raw)
+    (OUT_DIR / "data_passport_raw.json").write_text(
+        json.dumps({"sha256": checksum, **passport_raw},
+                   indent=2, ensure_ascii=False),
+        encoding="utf-8")
+
+    df = clean(df_raw)
+    passport_clean = data_passport(df)
+    (OUT_DIR / "data_passport_clean.json").write_text(
+        json.dumps(passport_clean, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+
+    num_cols, cat_cols = column_types(df)
+    print(f"  shape={df.shape}, num_cols={len(num_cols)}, cat_cols={len(cat_cols)}")
+
+    # ---------- 2. РАЗБИЕНИЕ ----------
+    print("[2/9] Разбиение train/test и expanding-window")
+    train_df, test_df = time_split(df, TEST_FRACTION)
+    train_df.to_csv(OUT_DIR / "train.csv", index=False)
+    test_df.to_csv(OUT_DIR / "test.csv", index=False)
+    folds = expanding_window_folds(train_df, N_EXPANDING_FOLDS)
+    (OUT_DIR / "splits.json").write_text(json.dumps(
+        {"n_train": len(train_df), "n_test": len(test_df),
+         "fold_sizes": [(int(len(a)), int(len(b))) for a, b in folds]}),
+        encoding="utf-8")
+    print(f"  n_train={len(train_df)}, n_test={len(test_df)}, "
+          f"folds={[(len(a), len(b)) for a, b in folds]}")
+
+    # ---------- 3. EDA (только на train) ----------
+    print("[3/9] EDA на train")
+    eda_report(train_df, str(OUT_DIR))
+
+    # ---------- 4. ПОИСК ГИПЕРПАРАМЕТРОВ ----------
+    print("[4/9] Поиск гиперпараметров на expanding-window")
+    families = ["logreg", "knn", "svm", "tree", "rf", "gb", "nb", "own_logreg"]
+    best_per_family = {}
+    search_tables = []
+
+    for fam in families:
+        print(f"\n=== {fam} ===")
+        all_tables = []
+        for fi, (itr, iva) in enumerate(folds):
+            sub_tr = train_df.iloc[itr].reset_index(drop=True)
+            sub_va = train_df.iloc[iva].reset_index(drop=True)
+
+            # облегчение для дорогих семейств — допустимо по заданию,
+            # если описано в отчёте
+            if fam == "svm" and "rbf" in PARAM_GRIDS["svm"].get("kernel", []):
+                n_svm = min(8000, len(sub_tr))
+                sub_tr_svm = sub_tr.sample(n=n_svm, random_state=RANDOM_STATE).reset_index(drop=True)
+            else:
+                sub_tr_svm = sub_tr
+
+            try:
+                best, table = search_family(
+                    fam, sub_tr_svm, sub_va, num_cols, cat_cols,
+                    PARAM_GRIDS[fam], log_rows)
+            except Exception as e:
+                print(f"  [ОШИБКА fold {fi}] {type(e).__name__}: {e}")
+                traceback.print_exc()
+                continue
+
+            if len(table) == 0:
+                continue
+            table["fold"] = fi
+            table["family"] = fam
+            all_tables.append(table)
+            print(f"  fold {fi}: best AP={best['AP']:.4f} "
+                  f"params={best['params']} "
+                  f"(перебрано {len(table)} конфигураций)")
+
+        if not all_tables:
+            print(f"  [пропуск] {fam}: не удалось получить результаты")
+            continue
+
+        df_fam = pd.concat(all_tables, ignore_index=True)
+        df_fam["params_key"] = df_fam["params"].apply(_params_key)
+
+        # среднее и std по фолдам для КАЖДОЙ конфигурации
+        agg = (df_fam
+               .groupby("params_key")
+               .agg(mean_AP=("AP", "mean"),
+                    std_AP=("AP", "std"),
+                    mean_time_s=("time_s", "mean"),
+                    n_folds=("AP", "count"))
+               .reset_index()
+               .sort_values("mean_AP", ascending=False))
+        agg["family"] = fam
+        search_tables.append(agg)
+
+        best_row = agg.iloc[0]
+        best_per_family[fam] = {
+            "best_params": json.loads(best_row["params_key"]),
+            "mean_AP": float(best_row["mean_AP"]),
+            "std_AP": float(best_row["std_AP"] if pd.notna(best_row["std_AP"]) else 0.0),
+            "mean_time_s": float(best_row["mean_time_s"]),
+            "n_folds": int(best_row["n_folds"]),
+        }
+        print(f"  >> {fam}: mean AP={best_row['mean_AP']:.4f} "
+              f"± {best_row['std_AP'] if pd.notna(best_row['std_AP']) else 0:.4f} "
+              f"params={best_row['params_key']}")
+        log_run(model=fam, stage="search",
+                best_params=best_row["params_key"],
+                mean_AP=float(best_row["mean_AP"]),
+                std_AP=float(best_row["std_AP"] if pd.notna(best_row["std_AP"]) else 0.0),
+                metric="AP_expanding")
+
+    if search_tables:
+        pd.concat(search_tables, ignore_index=True).to_csv(SEARCH_PATH, index=False)
+        print(f"  сводка поиска сохранена: {SEARCH_PATH}")
+
+    # ---------- 5. DUMMY-БЕЙЗЛАЙН ----------
+    print("\n[5/9] Dummy-бейзлайн на тесте")
+    from sklearn.dummy import DummyClassifier
+    dummy = DummyClassifier(strategy="prior").fit(
+        train_df[num_cols + cat_cols], train_df["y"])
+    dummy_proba = np.asarray(dummy.predict_proba(test_df[num_cols + cat_cols]))
+    dummy_scores = dummy_proba[:, 1]
+    dummy_metrics = classification_metrics(test_df["y"].values, dummy_scores, 0.5)
+    log_run(model="dummy", stage="test", metrics=json.dumps(dummy_metrics))
+    print(f"  DUMMY test AP: {dummy_metrics['AP']:.4f}")
+
+    # ---------- 6. НЕЙРОСЕТЬ ----------
+    print("\n[6/9] Обучение нейросети")
+    pre_nn = make_preprocessor(num_cols, cat_cols)
+    X_tr_full = pre_nn.fit_transform(train_df[num_cols + cat_cols])
+    X_te_full = pre_nn.transform(test_df[num_cols + cat_cols])
+    y_tr_full = train_df["y"].values
+    y_te_full = test_df["y"].values
+
+    # внутренняя валидация из конца обучающего окна (временная задача)
+    n_inner = int(0.15 * len(train_df))
+    X_fit, y_fit = X_tr_full[:-n_inner], y_tr_full[:-n_inner]
+    X_inner, y_inner = X_tr_full[-n_inner:], y_tr_full[-n_inner:]
+
+    nn_results = []
+    for ci, cfg in enumerate(NN_CONFIGS):
+        seed_aps = []
+        for seed in NN_SEEDS:
+            model, hist, best = train_nn(
+                X_fit, y_fit, X_inner, y_inner, cfg,
+                max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
+            ap_inner = float(hist[-1]["val_AP"]) if hist else float("nan")
+            # берём максимум по истории — устойчивее к шуму в последней эпохе
+            ap_inner = float(max(h["val_AP"] for h in hist))
+            seed_aps.append(ap_inner)
+            nn_results.append({"cfg": cfg, "seed": seed,
+                               "inner_AP": ap_inner,
+                               "epochs_used": best["epoch"] + 1})
+        log_run(model="nn", stage="search",
+                params=json.dumps(cfg, sort_keys=True),
+                metric="AP_inner",
+                mean=float(np.mean(seed_aps)),
+                std=float(np.std(seed_aps)))
+
+    # группируем по конфигурации, выбираем по среднему по seed
+    cfg_groups = {}
+    for r in nn_results:
+        k = json.dumps(r["cfg"], sort_keys=True)
+        cfg_groups.setdefault(k, []).append(r["inner_AP"])
+    cfg_summary = [
+        {"cfg_key": k, "cfg": json.loads(k),
+         "mean": float(np.mean(v)), "std": float(np.std(v))}
+        for k, v in cfg_groups.items()
+    ]
+    cfg_summary.sort(key=lambda r: -r["mean"])
+    nn_best_cfg = cfg_summary[0]
+    print(f"  лучшая NN-конфигурация: mean inner AP={nn_best_cfg['mean']:.4f} "
+          f"± {nn_best_cfg['std']:.4f} cfg={nn_best_cfg['cfg']}")
+
+    # финальный прогон лучшей NN на всём train
+    nn_test_scores = []
+    nn_states = []
+    for seed in NN_SEEDS:
+        model, hist, best = train_nn(
+            X_tr_full, y_tr_full, X_inner, y_inner,
+            nn_best_cfg["cfg"],
+            max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
+        s = predict_scores_nn(model, X_te_full)
+        nn_test_scores.append(s)
+        nn_states.append({"state": {k: v.cpu() for k, v in model.state_dict().items()},
+                          "seed": seed})
+        log_run(model="nn", stage="test_final_seed",
+                params=json.dumps(nn_best_cfg["cfg"], sort_keys=True),
+                seed=seed,
+                AP=classification_metrics(y_te_full, s)["AP"])
+
+    nn_scores_avg = np.mean(nn_test_scores, axis=0)
+    nn_metrics = classification_metrics(y_te_full, nn_scores_avg)
+    log_run(model="nn", stage="test",
+            params=json.dumps(nn_best_cfg["cfg"], sort_keys=True),
+            metrics=json.dumps(nn_metrics), metric="AP")
+    torch.save(nn_states, OUT_DIR / "nn_weights.pt")
+    joblib.dump(pre_nn, OUT_DIR / "nn_preprocessor.joblib")
+    plot_roc_pr(y_te_full, nn_scores_avg, str(OUT_DIR))
+    print(f"  NN test AP: {nn_metrics['AP']:.4f}")
+
+    # ---------- 7. ФИНАЛЬНЫЕ КЛАССИЧЕСКИЕ МОДЕЛИ ----------
+    print("\n[7/9] Финальное обучение классических моделей на всём train")
+    test_scores = {}
+    for fam, info in best_per_family.items():
+        params = info["best_params"]
+        print(f"  {fam}: {params}")
+        try:
+            t0 = time.time()
+            if fam == "own_logreg":
+                pre = make_preprocessor(num_cols, cat_cols)
+                adapter = OwnLogregAdapter(**params).fit(
+                    pre, train_df[num_cols + cat_cols], train_df["y"])
+                scores = adapter.score(test_df[num_cols + cat_cols])
+                joblib.dump({"type": "own", "pre": pre,
+                             "model": adapter.model},
+                            OUT_DIR / "own_logreg_final.joblib")
+            else:
+                pre = make_preprocessor(num_cols, cat_cols)
+                model = build_model(fam, params)
+                from sklearn.pipeline import Pipeline
+                pipe = Pipeline([("pre", pre), ("model", model)])
+                pipe.fit(train_df[num_cols + cat_cols], train_df["y"])
+                scores = get_scores(pipe, test_df[num_cols + cat_cols])
+                joblib.dump(pipe, OUT_DIR / f"{fam}_final.joblib")
+            train_time = time.time() - t0
+        except Exception as e:
+            print(f"  [ОШИБКА {fam}] {type(e).__name__}: {e}")
+            traceback.print_exc()
+            continue
+
+        # порог — ТОЛЬКО по последнему expanding-фолду
+        itr, iva = folds[-1]
+        sub_tr = train_df.iloc[itr].reset_index(drop=True)
+        sub_va = train_df.iloc[iva].reset_index(drop=True)
+        try:
+            if fam == "own_logreg":
+                pre_v = make_preprocessor(num_cols, cat_cols)
+                tmp = OwnLogregAdapter(**params).fit(
+                    pre_v, sub_tr[num_cols + cat_cols], sub_tr["y"])
+                val_scores = tmp.score(sub_va[num_cols + cat_cols])
+            else:
+                from sklearn.pipeline import Pipeline
+                pre_v = make_preprocessor(num_cols, cat_cols)
+                p_v = Pipeline([("pre", pre_v),
+                                ("model", build_model(fam, params))])
+                p_v.fit(sub_tr[num_cols + cat_cols], sub_tr["y"])
+                val_scores = get_scores(p_v, sub_va[num_cols + cat_cols])
+            thr, _ = find_best_threshold(sub_va["y"].values, val_scores, metric="f1")
+        except Exception as e:
+            print(f"  [порог {fam}] {type(e).__name__}: {e} — беру 0.5")
+            thr = 0.5
+
+        metrics = classification_metrics(test_df["y"].values, scores, thr)
+        metrics["train_time_s"] = float(train_time)
+        metrics["threshold_source"] = "val (last expanding fold)"
+        test_scores[fam] = scores
+        log_run(model=fam, stage="test", params=json.dumps(params, default=str),
+                metrics=json.dumps(metrics), metric="AP")
+        print(f"  {fam:12s} test AP={metrics['AP']:.4f} "
+              f"F1={metrics['f1']:.4f} thr={thr:.3f} "
+              f"time={train_time:.1f}s")
+
+    # ---------- 8. СРАВНЕНИЕ ЛУЧШИХ ДВУХ ----------
+    print("\n[8/9] Сравнение двух лучших моделей (bootstrap AP)")
+    family_ap = {fam: classification_metrics(test_df["y"].values, s)["AP"]
+                 for fam, s in test_scores.items()}
+    family_ap["nn"] = nn_metrics["AP"]
+    all_scores = dict(test_scores)
+    all_scores["nn"] = nn_scores_avg
+
+    sorted_by_ap = sorted(family_ap.items(), key=lambda kv: -kv[1])
+    print("  Итог по AP:")
+    for name, ap in sorted_by_ap:
+        print(f"    {name:12s} AP={ap:.4f}")
+
+    if len(sorted_by_ap) >= 2:
+        top2 = sorted_by_ap[:2]
+        diff = bootstrap_diff_ap(test_df["y"].values,
+                                 all_scores[top2[0][0]],
+                                 all_scores[top2[1][0]])
+        print(f"  Bootstrap AP({top2[0][0]}) - AP({top2[1][0]}): "
+              f"mean={diff['mean']:+.4f} "
+              f"95% CI [{diff['ci_low']:+.4f}, {diff['ci_high']:+.4f}]")
+        (OUT_DIR / "bootstrap_top2.json").write_text(json.dumps(
+            {"model_a": top2[0][0], "model_b": top2[1][0], **diff},
+            indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # ---------- 9. ИТОГОВАЯ ТАБЛИЦА ----------
+    print("\n[9/9] Итоговая таблица")
+    final_table = pd.DataFrame(
+        [{"model": fam, "AP_test": ap} for fam, ap in family_ap.items()]
+    ).sort_values("AP_test", ascending=False)
+    final_table.to_csv(OUT_DIR / "final_leaderboard.csv", index=False)
+    print(final_table.to_string(index=False))
+
+    print(f"\nЖурнал:      {LOG_PATH}")
+    print(f"Сводка поиска: {SEARCH_PATH}")
+    print(f"Артефакты:   {OUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
