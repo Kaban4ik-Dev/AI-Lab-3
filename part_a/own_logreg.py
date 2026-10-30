@@ -49,29 +49,38 @@ class OwnLogisticRegression:
         n, d = X.shape
         self.w = np.zeros(d)
         self.b = 0.0
-        prev = np.inf
         self.loss_history = []
-        last_good_w = self.w.copy()
-        last_good_b = self.b
+        loss, gw, gb = self._loss_and_grads(X, y)
+        self.loss_history.append(loss)
 
         for it in range(self.max_iter):
-            loss, gw, gb = self._loss_and_grads(X, y)
-            if not np.isfinite(loss):
-                # расходимся — откатываемся
-                self.w = last_good_w
-                self.b = last_good_b
+            # backtracking: уменьшаем lr, пока loss не уменьшится
+            lr = self.lr
+            improved = False
+            for _ in range(30):
+                w_new = self.w - lr * gw
+                b_new = self.b - lr * gb
+                if not (np.all(np.isfinite(w_new)) and np.isfinite(b_new)):
+                    lr *= 0.5
+                    continue
+                # временно подставляем и считаем loss
+                old_w, old_b = self.w, self.b
+                self.w, self.b = w_new, b_new
+                new_loss, gw_new, gb_new = self._loss_and_grads(X, y)
+                self.w, self.b = old_w, old_b
+                if np.isfinite(new_loss) and new_loss < loss:
+                    self.w, self.b = w_new, b_new
+                    gw, gb = gw_new, gb_new
+                    improved = True
+                    break
+                lr *= 0.5
+            if not improved:
                 break
+            prev_loss = loss
+            loss = new_loss
             self.loss_history.append(loss)
-            if abs(prev - loss) < self.tol:
+            if abs(prev_loss - loss) < self.tol:
                 break
-            self.w -= self.lr * gw
-            self.b -= self.lr * gb
-            # запоминаем «хорошие» веса
-            if np.all(np.isfinite(self.w)) and np.isfinite(self.b):
-                last_good_w = self.w.copy()
-                last_good_b = self.b
-            prev = loss
-
         return self
 
     def predict_proba(self, X):

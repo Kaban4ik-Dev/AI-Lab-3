@@ -19,7 +19,7 @@ from eda import eda_report
 from splits import time_split, expanding_window_folds
 from models_sklearn import (make_preprocessor, build_model, get_scores,
                             search_family, OwnLogregAdapter)
-from model_nn import train_nn, predict_scores_nn
+from model_nn import train_nn, predict_scores_nn, count_params
 from metrics_utils import (classification_metrics, find_best_threshold,
                            plot_roc_pr, bootstrap_diff_ap)
 
@@ -47,7 +47,6 @@ def _params_key(p):
 
 
 def plot_roc_pr_named(y_true, scores, prefix_dir, name):
-    """Сохранение ROC/PR в отдельный файл (без перезаписи)."""
     from sklearn.metrics import roc_curve, precision_recall_curve
     fpr, tpr, _ = roc_curve(y_true, scores)
     prec, rec, _ = precision_recall_curve(y_true, scores)
@@ -203,14 +202,14 @@ def main():
             model, hist, best = train_nn(
                 X_fit, y_fit, X_inner, y_inner, cfg,
                 max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
-            # === ПРАВКА 1: сохраняем историю обучения для кривых ===
             pd.DataFrame(hist).to_csv(
                 OUT_DIR / f"nn_history_cfg{ci}_seed{seed}.csv", index=False)
             ap_inner = float(max(h["val_AP"] for h in hist)) if hist else float("nan")
             seed_aps.append(ap_inner)
             nn_results.append({"cfg": cfg, "seed": seed,
                                "inner_AP": ap_inner,
-                               "epochs_used": best["epoch"] + 1})
+                               "epochs_used": best["epoch"] + 1,
+                               "n_params": count_params(model)})
         log_run(model="nn", stage="search",
                 params=json.dumps(cfg, sort_keys=True),
                 metric="AP_inner",
@@ -233,37 +232,42 @@ def main():
 
     nn_test_scores = []
     nn_states = []
+    nn_n_params = None
     for seed in NN_SEEDS:
         model, hist, best = train_nn(
             X_tr_full, y_tr_full, X_inner, y_inner,
             nn_best_cfg["cfg"],
             max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
-        # ещё раз сохраняем — на этот раз уже финального обучения на всём train
         pd.DataFrame(hist).to_csv(
             OUT_DIR / f"nn_history_final_seed{seed}.csv", index=False)
+        nn_n_params = count_params(model)
         s = predict_scores_nn(model, X_te_full)
         nn_test_scores.append(s)
         nn_states.append({"state": {k: v.cpu() for k, v in model.state_dict().items()},
-                          "seed": seed})
+                          "seed": seed,
+                          "n_params": nn_n_params})
         log_run(model="nn", stage="test_final_seed",
                 params=json.dumps(nn_best_cfg["cfg"], sort_keys=True),
                 seed=seed,
-                AP=classification_metrics(y_te_full, s)["AP"])
+                AP=classification_metrics(y_te_full, s)["AP"],
+                n_params=nn_n_params)
 
     nn_scores_avg = np.mean(nn_test_scores, axis=0)
     nn_metrics = classification_metrics(y_te_full, nn_scores_avg)
+    nn_metrics["n_params"] = int(nn_n_params) if nn_n_params is not None else None
     log_run(model="nn", stage="test",
             params=json.dumps(nn_best_cfg["cfg"], sort_keys=True),
             metrics=json.dumps(nn_metrics), metric="AP")
     torch.save(nn_states, OUT_DIR / "nn_weights.pt")
     joblib.dump(pre_nn, OUT_DIR / "nn_preprocessor.joblib")
     plot_roc_pr_named(y_te_full, nn_scores_avg, str(OUT_DIR), name="nn")
-    print(f"  NN test AP: {nn_metrics['AP']:.4f}")
+    print(f"  NN test AP: {nn_metrics['AP']:.4f}  n_params={nn_n_params}")
 
     # ---------- 7. ФИНАЛЬНЫЕ КЛАССИЧЕСКИЕ МОДЕЛИ ----------
     print("\n[7/9] Финальное обучение классических моделей на всём train")
     test_scores = {}
     predict_times = {}
+    n_params_per_family = {}
     for fam, info in best_per_family.items():
         params = info["best_params"]
         print(f"  {fam}: {params}")
@@ -274,10 +278,10 @@ def main():
                 adapter = OwnLogregAdapter(**params).fit(
                     pre, train_df[num_cols + cat_cols], train_df["y"])
                 train_time = time.time() - t0
-                # === ПРАВКА: время предсказания ===
                 tp0 = time.time()
                 scores = adapter.score(test_df[num_cols + cat_cols])
                 predict_times[fam] = time.time() - tp0
+                n_params_per_family[fam] = int(adapter.model.w.size + 1)
                 joblib.dump({"type": "own", "pre": pre,
                              "model": adapter.model},
                             OUT_DIR / "own_logreg_final.joblib")
@@ -291,6 +295,8 @@ def main():
                 tp0 = time.time()
                 scores = get_scores(pipe, test_df[num_cols + cat_cols])
                 predict_times[fam] = time.time() - tp0
+                # число обучаемых параметров, где применимо
+                n_params_per_family[fam] = _count_model_params(pipe.named_steps["model"])
                 joblib.dump(pipe, OUT_DIR / f"{fam}_final.joblib")
         except Exception as e:
             print(f"  [ОШИБКА {fam}] {type(e).__name__}: {e}")
@@ -323,14 +329,15 @@ def main():
         metrics["train_time_s"] = float(train_time)
         metrics["predict_time_s"] = float(predict_times[fam])
         metrics["threshold_source"] = "val (last expanding fold)"
+        metrics["n_params"] = n_params_per_family.get(fam)
         test_scores[fam] = scores
         log_run(model=fam, stage="test", params=json.dumps(params, default=str),
                 metrics=json.dumps(metrics), metric="AP")
-        # === ПРАВКА 2: ROC/PR для каждой модели с отдельным именем ===
         plot_roc_pr_named(test_df["y"].values, scores, str(OUT_DIR), name=fam)
         print(f"  {fam:12s} test AP={metrics['AP']:.4f} "
               f"F1={metrics['f1']:.4f} thr={thr:.3f} "
-              f"train={train_time:.1f}s pred={predict_times[fam]:.2f}s")
+              f"train={train_time:.1f}s pred={predict_times[fam]:.2f}s "
+              f"n_params={metrics['n_params']}")
 
     # ---------- 8. СРАВНЕНИЕ ЛУЧШИХ ДВУХ ----------
     print("\n[8/9] Сравнение двух лучших (bootstrap AP)")
@@ -360,9 +367,14 @@ def main():
     print("\n[9/9] Итоговая таблица")
     rows = []
     for fam, ap in family_ap.items():
+        if fam == "nn":
+            n_par = nn_n_params
+        else:
+            n_par = n_params_per_family.get(fam)
         rows.append({
             "model": fam,
             "AP_test": ap,
+            "n_params": n_par,
             "train_time_s": (float(best_per_family[fam]["mean_time_s"])
                              if fam in best_per_family else None),
             "predict_time_s": predict_times.get(fam, None),
@@ -374,6 +386,31 @@ def main():
     print(f"\nЖурнал:      {LOG_PATH}")
     print(f"Сводка:      {SEARCH_PATH}")
     print(f"Артефакты:   {OUT_DIR.resolve()}")
+
+
+def _count_model_params(model):
+    """Оценка числа обучаемых параметров для классических моделей (где есть)."""
+    try:
+        if hasattr(model, "coef_"):
+            n = int(np.sum(model.coef_.size))
+            if getattr(model, "intercept_", None) is not None:
+                n += int(np.sum(np.asarray(model.intercept_).size))
+            return n
+        if hasattr(model, "tree_"):
+            t = model.tree_
+            return int(t.node_count)
+        if hasattr(model, "estimators_"):
+            # ансамбли деревьев: суммарное число узлов
+            total = 0
+            for est in np.ravel(model.estimators_):
+                if hasattr(est, "tree_"):
+                    total += int(est.tree_.node_count)
+            return int(total) if total > 0 else None
+        if hasattr(model, "classes_"):
+            return None  # NB/Dummy — параметры не сопоставимы напрямую
+    except Exception:
+        return None
+    return None
 
 
 if __name__ == "__main__":
