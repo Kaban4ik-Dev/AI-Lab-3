@@ -4,12 +4,8 @@ import numpy as np
 class OwnKMeans:
     """
     K-means (Lloyd) с инициализацией k-means++.
-    Обрабатывает:
-      - пустые кластеры (переинициализация дальней точкой);
-      - k > n (берём только n центров);
-      - совпадающие точки / нулевые расстояния на шаге k-means++;
-      - NaN/нечисловые данные (проверка).
-    Критерий остановки: |Δ inertia| < tol или max_iter.
+    Поддерживает внешние стартовые центры (для строгого сравнения с sklearn
+    при одинаковой инициализации и n_init = 1).
     """
 
     def __init__(self, n_clusters=3, n_init=1, max_iter=300, tol=1e-6,
@@ -24,14 +20,24 @@ class OwnKMeans:
         self.labels_ = None
         self.inertia_ = None
         self.n_iter_ = 0
+        # внешние стартовые центры (опционально)
+        self._init_centers_override = None
 
     @staticmethod
     def _sq_dist(X, C):
         return ((X[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
 
     def _init_centers(self, X, rng):
+        # если заданы внешние стартовые центры — используем их
+        if self._init_centers_override is not None:
+            C = np.asarray(self._init_centers_override, dtype=np.float64)
+            if C.shape[0] != min(self.n_clusters, len(X)):
+                raise ValueError(
+                    "init_centers_override shape mismatch with n_clusters")
+            return C.copy()
+
         n, d = X.shape
-        k = min(self.n_clusters, n)  # k не больше числа точек
+        k = min(self.n_clusters, n)
 
         if self.init == "random":
             idx = rng.choice(n, size=k, replace=False)
@@ -46,12 +52,11 @@ class OwnKMeans:
         for j in range(1, k):
             s = closest.sum()
             if s <= 0:
-                # все точки уже совпали с центрами (дубликаты) —
-                # выбираем любые ещё не выбранные индексы
-                unchosen = np.setdiff1d(np.arange(n),
-                                        np.where(np.any(np.all(
-                                            X[:, None, :] == centers[None, :j, :],
-                                            axis=2), axis=1))[0])
+                unchosen = np.setdiff1d(
+                    np.arange(n),
+                    np.where(np.any(np.all(
+                        X[:, None, :] == centers[None, :j, :], axis=2),
+                        axis=1))[0])
                 if len(unchosen) == 0:
                     unchosen = np.arange(n)
                 idx = int(rng.choice(unchosen))
@@ -81,9 +86,7 @@ class OwnKMeans:
             for c in range(k):
                 mask = labels == c
                 if not mask.any():
-                    # пустой кластер: берём точку, максимально удалённую
-                    # от своего текущего центра; если все уже центры —
-                    # берём точку с наибольшим расстоянием до ближайшего
+                    # пустой кластер: точка, максимально удалённая от центра
                     min_d = d[np.arange(n), labels]
                     far_idx = int(min_d.argmax())
                     new_centers[c] = X[far_idx]
@@ -113,7 +116,6 @@ class OwnKMeans:
                 best = (c, l, i, nit)
         assert best is not None
         self.centers_, self.labels_, self.inertia_, self.n_iter_ = best
-        # если k > n, эффективное число кластеров = n
         return self
 
     def predict(self, X):

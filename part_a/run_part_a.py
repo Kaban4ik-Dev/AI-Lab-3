@@ -1,4 +1,3 @@
-# run_part_a.py — полностью исправленная версия
 import json
 import time
 import warnings
@@ -8,6 +7,8 @@ import numpy as np
 import pandas as pd
 import joblib
 import torch
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 from config import (DATA_PATH, OUT_DIR, RANDOM_STATE, TEST_FRACTION,
                     N_EXPANDING_FOLDS, PARAM_GRIDS, NN_CONFIGS, NN_SEEDS,
@@ -22,7 +23,6 @@ from model_nn import train_nn, predict_scores_nn
 from metrics_utils import (classification_metrics, find_best_threshold,
                            plot_roc_pr, bootstrap_diff_ap)
 
-# --- подавляем шум от sklearn (не влияет на результаты) ---
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.impute")
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 
@@ -44,6 +44,21 @@ def log_run(**kw):
 
 def _params_key(p):
     return json.dumps(p, sort_keys=True, default=str)
+
+
+def plot_roc_pr_named(y_true, scores, prefix_dir, name):
+    """Сохранение ROC/PR в отдельный файл (без перезаписи)."""
+    from sklearn.metrics import roc_curve, precision_recall_curve
+    fpr, tpr, _ = roc_curve(y_true, scores)
+    prec, rec, _ = precision_recall_curve(y_true, scores)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(fpr, tpr); axes[0].plot([0, 1], [0, 1], "--")
+    axes[0].set_xlabel("FPR"); axes[0].set_ylabel("TPR"); axes[0].set_title("ROC")
+    axes[1].plot(rec, prec)
+    axes[1].set_xlabel("Recall"); axes[1].set_ylabel("Precision"); axes[1].set_title("PR")
+    plt.tight_layout()
+    plt.savefig(Path(prefix_dir) / f"roc_pr_{name}.png", dpi=120)
+    plt.close()
 
 
 def main():
@@ -79,7 +94,7 @@ def main():
     print(f"  n_train={len(train_df)}, n_test={len(test_df)}, "
           f"folds={[(len(a), len(b)) for a, b in folds]}")
 
-    # ---------- 3. EDA (только на train) ----------
+    # ---------- 3. EDA ----------
     print("[3/9] EDA на train")
     eda_report(train_df, str(OUT_DIR))
 
@@ -96,8 +111,6 @@ def main():
             sub_tr = train_df.iloc[itr].reset_index(drop=True)
             sub_va = train_df.iloc[iva].reset_index(drop=True)
 
-            # облегчение для дорогих семейств — допустимо по заданию,
-            # если описано в отчёте
             if fam == "svm" and "rbf" in PARAM_GRIDS["svm"].get("kernel", []):
                 n_svm = min(8000, len(sub_tr))
                 sub_tr_svm = sub_tr.sample(n=n_svm, random_state=RANDOM_STATE).reset_index(drop=True)
@@ -129,7 +142,6 @@ def main():
         df_fam = pd.concat(all_tables, ignore_index=True)
         df_fam["params_key"] = df_fam["params"].apply(_params_key)
 
-        # среднее и std по фолдам для КАЖДОЙ конфигурации
         agg = (df_fam
                .groupby("params_key")
                .agg(mean_AP=("AP", "mean"),
@@ -162,13 +174,12 @@ def main():
         pd.concat(search_tables, ignore_index=True).to_csv(SEARCH_PATH, index=False)
         print(f"  сводка поиска сохранена: {SEARCH_PATH}")
 
-    # ---------- 5. DUMMY-БЕЙЗЛАЙН ----------
+    # ---------- 5. DUMMY ----------
     print("\n[5/9] Dummy-бейзлайн на тесте")
     from sklearn.dummy import DummyClassifier
     dummy = DummyClassifier(strategy="prior").fit(
         train_df[num_cols + cat_cols], train_df["y"])
-    dummy_proba = np.asarray(dummy.predict_proba(test_df[num_cols + cat_cols]))
-    dummy_scores = dummy_proba[:, 1]
+    dummy_scores = dummy.predict_proba(test_df[num_cols + cat_cols])[:, 1]
     dummy_metrics = classification_metrics(test_df["y"].values, dummy_scores, 0.5)
     log_run(model="dummy", stage="test", metrics=json.dumps(dummy_metrics))
     print(f"  DUMMY test AP: {dummy_metrics['AP']:.4f}")
@@ -181,7 +192,6 @@ def main():
     y_tr_full = train_df["y"].values
     y_te_full = test_df["y"].values
 
-    # внутренняя валидация из конца обучающего окна (временная задача)
     n_inner = int(0.15 * len(train_df))
     X_fit, y_fit = X_tr_full[:-n_inner], y_tr_full[:-n_inner]
     X_inner, y_inner = X_tr_full[-n_inner:], y_tr_full[-n_inner:]
@@ -193,9 +203,10 @@ def main():
             model, hist, best = train_nn(
                 X_fit, y_fit, X_inner, y_inner, cfg,
                 max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
-            ap_inner = float(hist[-1]["val_AP"]) if hist else float("nan")
-            # берём максимум по истории — устойчивее к шуму в последней эпохе
-            ap_inner = float(max(h["val_AP"] for h in hist))
+            # === ПРАВКА 1: сохраняем историю обучения для кривых ===
+            pd.DataFrame(hist).to_csv(
+                OUT_DIR / f"nn_history_cfg{ci}_seed{seed}.csv", index=False)
+            ap_inner = float(max(h["val_AP"] for h in hist)) if hist else float("nan")
             seed_aps.append(ap_inner)
             nn_results.append({"cfg": cfg, "seed": seed,
                                "inner_AP": ap_inner,
@@ -206,7 +217,6 @@ def main():
                 mean=float(np.mean(seed_aps)),
                 std=float(np.std(seed_aps)))
 
-    # группируем по конфигурации, выбираем по среднему по seed
     cfg_groups = {}
     for r in nn_results:
         k = json.dumps(r["cfg"], sort_keys=True)
@@ -221,7 +231,6 @@ def main():
     print(f"  лучшая NN-конфигурация: mean inner AP={nn_best_cfg['mean']:.4f} "
           f"± {nn_best_cfg['std']:.4f} cfg={nn_best_cfg['cfg']}")
 
-    # финальный прогон лучшей NN на всём train
     nn_test_scores = []
     nn_states = []
     for seed in NN_SEEDS:
@@ -229,6 +238,9 @@ def main():
             X_tr_full, y_tr_full, X_inner, y_inner,
             nn_best_cfg["cfg"],
             max_epochs=NN_MAX_EPOCHS, patience=NN_PATIENCE, seed=seed)
+        # ещё раз сохраняем — на этот раз уже финального обучения на всём train
+        pd.DataFrame(hist).to_csv(
+            OUT_DIR / f"nn_history_final_seed{seed}.csv", index=False)
         s = predict_scores_nn(model, X_te_full)
         nn_test_scores.append(s)
         nn_states.append({"state": {k: v.cpu() for k, v in model.state_dict().items()},
@@ -245,12 +257,13 @@ def main():
             metrics=json.dumps(nn_metrics), metric="AP")
     torch.save(nn_states, OUT_DIR / "nn_weights.pt")
     joblib.dump(pre_nn, OUT_DIR / "nn_preprocessor.joblib")
-    plot_roc_pr(y_te_full, nn_scores_avg, str(OUT_DIR))
+    plot_roc_pr_named(y_te_full, nn_scores_avg, str(OUT_DIR), name="nn")
     print(f"  NN test AP: {nn_metrics['AP']:.4f}")
 
     # ---------- 7. ФИНАЛЬНЫЕ КЛАССИЧЕСКИЕ МОДЕЛИ ----------
     print("\n[7/9] Финальное обучение классических моделей на всём train")
     test_scores = {}
+    predict_times = {}
     for fam, info in best_per_family.items():
         params = info["best_params"]
         print(f"  {fam}: {params}")
@@ -260,7 +273,11 @@ def main():
                 pre = make_preprocessor(num_cols, cat_cols)
                 adapter = OwnLogregAdapter(**params).fit(
                     pre, train_df[num_cols + cat_cols], train_df["y"])
+                train_time = time.time() - t0
+                # === ПРАВКА: время предсказания ===
+                tp0 = time.time()
                 scores = adapter.score(test_df[num_cols + cat_cols])
+                predict_times[fam] = time.time() - tp0
                 joblib.dump({"type": "own", "pre": pre,
                              "model": adapter.model},
                             OUT_DIR / "own_logreg_final.joblib")
@@ -270,15 +287,17 @@ def main():
                 from sklearn.pipeline import Pipeline
                 pipe = Pipeline([("pre", pre), ("model", model)])
                 pipe.fit(train_df[num_cols + cat_cols], train_df["y"])
+                train_time = time.time() - t0
+                tp0 = time.time()
                 scores = get_scores(pipe, test_df[num_cols + cat_cols])
+                predict_times[fam] = time.time() - tp0
                 joblib.dump(pipe, OUT_DIR / f"{fam}_final.joblib")
-            train_time = time.time() - t0
         except Exception as e:
             print(f"  [ОШИБКА {fam}] {type(e).__name__}: {e}")
             traceback.print_exc()
             continue
 
-        # порог — ТОЛЬКО по последнему expanding-фолду
+        # порог по последнему expanding-фолду
         itr, iva = folds[-1]
         sub_tr = train_df.iloc[itr].reset_index(drop=True)
         sub_va = train_df.iloc[iva].reset_index(drop=True)
@@ -302,21 +321,23 @@ def main():
 
         metrics = classification_metrics(test_df["y"].values, scores, thr)
         metrics["train_time_s"] = float(train_time)
+        metrics["predict_time_s"] = float(predict_times[fam])
         metrics["threshold_source"] = "val (last expanding fold)"
         test_scores[fam] = scores
         log_run(model=fam, stage="test", params=json.dumps(params, default=str),
                 metrics=json.dumps(metrics), metric="AP")
+        # === ПРАВКА 2: ROC/PR для каждой модели с отдельным именем ===
+        plot_roc_pr_named(test_df["y"].values, scores, str(OUT_DIR), name=fam)
         print(f"  {fam:12s} test AP={metrics['AP']:.4f} "
               f"F1={metrics['f1']:.4f} thr={thr:.3f} "
-              f"time={train_time:.1f}s")
+              f"train={train_time:.1f}s pred={predict_times[fam]:.2f}s")
 
     # ---------- 8. СРАВНЕНИЕ ЛУЧШИХ ДВУХ ----------
-    print("\n[8/9] Сравнение двух лучших моделей (bootstrap AP)")
+    print("\n[8/9] Сравнение двух лучших (bootstrap AP)")
     family_ap = {fam: classification_metrics(test_df["y"].values, s)["AP"]
                  for fam, s in test_scores.items()}
     family_ap["nn"] = nn_metrics["AP"]
-    all_scores = dict(test_scores)
-    all_scores["nn"] = nn_scores_avg
+    all_scores = dict(test_scores); all_scores["nn"] = nn_scores_avg
 
     sorted_by_ap = sorted(family_ap.items(), key=lambda kv: -kv[1])
     print("  Итог по AP:")
@@ -337,14 +358,21 @@ def main():
 
     # ---------- 9. ИТОГОВАЯ ТАБЛИЦА ----------
     print("\n[9/9] Итоговая таблица")
-    final_table = pd.DataFrame(
-        [{"model": fam, "AP_test": ap} for fam, ap in family_ap.items()]
-    ).sort_values("AP_test", ascending=False)
+    rows = []
+    for fam, ap in family_ap.items():
+        rows.append({
+            "model": fam,
+            "AP_test": ap,
+            "train_time_s": (float(best_per_family[fam]["mean_time_s"])
+                             if fam in best_per_family else None),
+            "predict_time_s": predict_times.get(fam, None),
+        })
+    final_table = pd.DataFrame(rows).sort_values("AP_test", ascending=False)
     final_table.to_csv(OUT_DIR / "final_leaderboard.csv", index=False)
     print(final_table.to_string(index=False))
 
     print(f"\nЖурнал:      {LOG_PATH}")
-    print(f"Сводка поиска: {SEARCH_PATH}")
+    print(f"Сводка:      {SEARCH_PATH}")
     print(f"Артефакты:   {OUT_DIR.resolve()}")
 
 

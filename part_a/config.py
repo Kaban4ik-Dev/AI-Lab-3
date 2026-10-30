@@ -1,8 +1,8 @@
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PATH = BASE_DIR / "data" / "bank-additional-full.csv"
-OUT_DIR = BASE_DIR / "outputs"
+OUT_DIR = BASE_DIR / "outputs_a"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 RANDOM_STATE = 42
