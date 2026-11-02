@@ -414,4 +414,8 @@ def _count_model_params(model):
 
 
 if __name__ == "__main__":
+    import time as _time
+    _t0 = _time.perf_counter()
     main()
+    _total = _time.perf_counter() - _t0
+    print(f"\nСуммарное время прогона: {_total:.2f} с")

@@ -13,7 +13,6 @@ env/
 ENV/
 
 # ===== IDE / OS =====
-.vscode/
 .idea/
 *.swp
 .DS_Store
@@ -34,3 +33,5 @@ data/*
 # ===== Вывод =====
 outputs_a/*
 outputs_b/*
+!outputs_a/.gitkeep
+!outputs_b/.gitkeep

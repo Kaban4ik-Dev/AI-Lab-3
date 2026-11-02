@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Part A: own_logreg_test.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_a/own_logreg_test.py",
+      "cwd": "${workspaceFolder}/part_a",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Part A: run_part_a.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_a/run_part_a.py",
+      "cwd": "${workspaceFolder}/part_a",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Part A: diagnostics.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_a/diagnostics.py",
+      "cwd": "${workspaceFolder}/part_a",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Part B: own_tests_b.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_b/own_tests_b.py",
+      "cwd": "${workspaceFolder}/part_b",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Part B: run_part_b.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_b/run_part_b.py",
+      "cwd": "${workspaceFolder}/part_b",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Part B: predict_example_b.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_b/predict_example_b.py",
+      "cwd": "${workspaceFolder}/part_b",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
