@@ -39,7 +39,7 @@ for c in cols:
 # масштабирование
 Z = sc.transform(X)
 
-prof_path = OUT / "segment_profile.csv"
+prof_path = OUT / "outputs_b" / "segment_profile.csv"
 cluster_id = int(model.predict(Z)[0]) if hasattr(model, "predict") else None
 
 if cluster_id is not None and prof_path.exists():

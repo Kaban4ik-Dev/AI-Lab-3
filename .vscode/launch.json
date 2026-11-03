@@ -29,6 +29,15 @@
       "justMyCode": true
     },
     {
+      "name": "Part A: predict_example_a.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/part_a/predict_example_a.py",
+      "cwd": "${workspaceFolder}/part_a",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
       "name": "Part B: own_tests_b.py",
       "type": "debugpy",
       "request": "launch",
